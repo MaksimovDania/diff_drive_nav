@@ -1,148 +1,274 @@
-"""Train a PPO agent for differential-drive navigation using Stable-Baselines3."""
+"""Train PPO or REINFORCE on the DiffDriveNav environment.
+
+Usage:
+    python train.py --algo ppo --total-timesteps 1000000
+    python train.py --algo reinforce --total-timesteps 1000000
+"""
 
 import argparse
-import os
 import json
-from pathlib import Path
+import os
+import time
 
 import numpy as np
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from env import DiffDriveNavEnv
+from agents import PPOAgent, ReinforceAgent, RolloutBuffer
 
 
-class MetricsCallback(BaseCallback):
-    """Logs per-episode metrics (return, success, collision) for later plotting."""
+def collect_rollout(env, agent, buffer, n_steps):
+    """Collect n_steps of experience into buffer. Returns episode stats."""
+    obs, _ = getattr(collect_rollout, "_state", (None, None))
+    if obs is None:
+        obs, _ = env.reset()
 
-    def __init__(self, log_dir: str, verbose=0):
-        super().__init__(verbose)
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+    ep_returns, ep_lengths, ep_successes, ep_collisions = [], [], [], []
+    ep_reward = getattr(collect_rollout, "_ep_reward", 0.0)
+    ep_len = getattr(collect_rollout, "_ep_len", 0)
 
-        self.episode_returns: list[float] = []
-        self.episode_lengths: list[int] = []
-        self.episode_successes: list[bool] = []
-        self.episode_collisions: list[bool] = []
-        self.episode_timesteps: list[int] = []  # global timestep when episode ended
+    for _ in range(n_steps):
+        action, log_prob, value = agent.select_action(obs)
+        clipped = np.clip(action, -1.0, 1.0)
+        next_obs, reward, terminated, truncated, info = env.step(clipped)
+        done = terminated or truncated
 
-    def _on_step(self) -> bool:
-        # check for completed episodes in the monitor wrapper
-        infos = self.locals.get("infos", [])
-        for info in infos:
-            if "episode" in info:
-                self.episode_returns.append(info["episode"]["r"])
-                self.episode_lengths.append(info["episode"]["l"])
-                self.episode_successes.append(info.get("success", False))
-                self.episode_collisions.append(info.get("collision", False))
-                self.episode_timesteps.append(self.num_timesteps)
-        return True
+        # store original action (not clipped) to match log_prob
+        buffer.store(obs, action, log_prob, reward, value, float(done))
+        ep_reward += reward
+        ep_len += 1
 
-    def _on_training_end(self) -> None:
-        np.savez(
-            self.log_dir / "training_metrics.npz",
-            returns=np.array(self.episode_returns),
-            lengths=np.array(self.episode_lengths),
-            successes=np.array(self.episode_successes),
-            collisions=np.array(self.episode_collisions),
-            timesteps=np.array(self.episode_timesteps),
-        )
-        if self.verbose:
-            print(f"Saved training metrics to {self.log_dir / 'training_metrics.npz'}")
+        if done:
+            ep_returns.append(ep_reward)
+            ep_lengths.append(ep_len)
+            ep_successes.append(info.get("success", False))
+            ep_collisions.append(info.get("collision", False))
+            ep_reward = 0.0
+            ep_len = 0
+            obs, _ = env.reset()
+        else:
+            obs = next_obs
+
+    # save state for next call
+    collect_rollout._state = (obs, None)
+    collect_rollout._ep_reward = ep_reward
+    collect_rollout._ep_len = ep_len
+
+    return {
+        "returns": ep_returns,
+        "lengths": ep_lengths,
+        "successes": ep_successes,
+        "collisions": ep_collisions,
+        "last_obs": obs,
+    }
 
 
-def make_env(render_mode=None):
-    env = DiffDriveNavEnv(render_mode=render_mode)
-    env = Monitor(env, info_keywords=("success", "collision"))
-    return env
+def collect_episodes(env, agent, buffer, n_episodes):
+    """Collect full episodes for REINFORCE. Returns episode stats."""
+    ep_returns, ep_lengths, ep_successes, ep_collisions = [], [], [], []
+
+    for _ in range(n_episodes):
+        obs, _ = env.reset()
+        done = False
+        ep_reward = 0.0
+
+        while not done:
+            action, log_prob, value = agent.select_action(obs)
+            clipped = np.clip(action, -1.0, 1.0)
+            next_obs, reward, terminated, truncated, info = env.step(clipped)
+            done = terminated or truncated
+            buffer.store(obs, action, log_prob, reward, value, float(done))
+            ep_reward += reward
+            obs = next_obs
+
+        ep_returns.append(ep_reward)
+        ep_lengths.append(info["step"])
+        ep_successes.append(info.get("success", False))
+        ep_collisions.append(info.get("collision", False))
+
+    return {
+        "returns": ep_returns,
+        "lengths": ep_lengths,
+        "successes": ep_successes,
+        "collisions": ep_collisions,
+    }
+
+
+def train_ppo(env, args):
+    agent = PPOAgent(
+        obs_dim=env.observation_space.shape[0],
+        act_dim=env.action_space.shape[0],
+        lr=args.lr,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_eps=args.clip_range,
+        entropy_coef=args.ent_coef,
+        n_epochs=args.n_epochs,
+        batch_size=args.batch_size,
+        hidden=args.hidden,
+    )
+
+    all_returns, all_lengths, all_successes, all_collisions, all_timesteps = [], [], [], [], []
+    total_steps = 0
+
+    # reset rollout collector state
+    for attr in ("_state", "_ep_reward", "_ep_len"):
+        if hasattr(collect_rollout, attr):
+            delattr(collect_rollout, attr)
+    n_updates = args.total_timesteps // args.n_steps
+    start = time.time()
+
+    for update in range(1, n_updates + 1):
+        buffer = RolloutBuffer()
+        stats = collect_rollout(env, agent, buffer, args.n_steps)
+        total_steps += args.n_steps
+
+        # get value of last observation for GAE bootstrap
+        with __import__("torch").no_grad():
+            _, _, next_val = agent.select_action(stats["last_obs"])
+
+        train_stats = agent.update(buffer, next_val)
+
+        # log
+        for r in stats["returns"]:
+            all_returns.append(r)
+            all_timesteps.append(total_steps)
+        all_lengths.extend(stats["lengths"])
+        all_successes.extend(stats["successes"])
+        all_collisions.extend(stats["collisions"])
+
+        if update % 10 == 0 and stats["returns"]:
+            recent_r = all_returns[-50:] if len(all_returns) >= 50 else all_returns
+            recent_s = all_successes[-50:] if len(all_successes) >= 50 else all_successes
+            fps = total_steps / (time.time() - start)
+            print(
+                f"[PPO] step={total_steps:>8d} | "
+                f"ep_ret={np.mean(recent_r):>7.1f} | "
+                f"success={np.mean(recent_s)*100:>5.1f}% | "
+                f"pg_loss={train_stats['pg_loss']:>.4f} | "
+                f"entropy={train_stats['entropy']:>.3f} | "
+                f"fps={fps:>.0f}"
+            )
+
+    return agent, all_returns, all_lengths, all_successes, all_collisions, all_timesteps
+
+
+def train_reinforce(env, args):
+    agent = ReinforceAgent(
+        obs_dim=env.observation_space.shape[0],
+        act_dim=env.action_space.shape[0],
+        lr=args.lr,
+        gamma=args.gamma,
+        entropy_coef=args.ent_coef,
+        hidden=args.hidden,
+    )
+
+    all_returns, all_lengths, all_successes, all_collisions, all_timesteps = [], [], [], [], []
+    total_steps = 0
+    start = time.time()
+    episode = 0
+
+    while total_steps < args.total_timesteps:
+        # collect single episode
+        buffer = RolloutBuffer()
+        obs, _ = env.reset()
+        done = False
+        ep_reward = 0.0
+
+        while not done:
+            action, log_prob, value = agent.select_action(obs)
+            clipped = np.clip(action, -1.0, 1.0)
+            next_obs, reward, terminated, truncated, info = env.step(clipped)
+            done = terminated or truncated
+            buffer.store(obs, action, log_prob, reward, value, float(done))
+            ep_reward += reward
+            obs = next_obs
+
+        ep_len = info["step"]
+        total_steps += ep_len
+        episode += 1
+
+        # update after each episode
+        train_stats = agent.update(buffer)
+
+        all_returns.append(ep_reward)
+        all_timesteps.append(total_steps)
+        all_lengths.append(ep_len)
+        all_successes.append(info.get("success", False))
+        all_collisions.append(info.get("collision", False))
+
+        if episode % 50 == 0:
+            recent_r = all_returns[-100:] if len(all_returns) >= 100 else all_returns
+            recent_s = all_successes[-100:] if len(all_successes) >= 100 else all_successes
+            fps = total_steps / (time.time() - start)
+            print(
+                f"[REINFORCE] step={total_steps:>8d} ep={episode:>5d} | "
+                f"ep_ret={np.mean(recent_r):>7.1f} | "
+                f"success={np.mean(recent_s)*100:>5.1f}% | "
+                f"pg_loss={train_stats['pg_loss']:>.4f} | "
+                f"entropy={train_stats['entropy']:>.3f} | "
+                f"fps={fps:>.0f}"
+            )
+
+    return agent, all_returns, all_lengths, all_successes, all_collisions, all_timesteps
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train PPO on DiffDriveNav")
-    parser.add_argument("--total-timesteps", type=int, default=2_000_000)
+    parser = argparse.ArgumentParser(description="Train RL agent on DiffDriveNav")
+    parser.add_argument("--algo", type=str, default="ppo", choices=["ppo", "reinforce"])
+    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--n-steps", type=int, default=2048)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--n-epochs", type=int, default=10)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--clip-range", type=float, default=0.2)
     parser.add_argument("--ent-coef", type=float, default=0.01)
-    parser.add_argument("--net-arch", type=int, nargs="+", default=[64, 64])
+    parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-dir", type=str, default="logs")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    parser.add_argument("--eval-freq", type=int, default=10_000,
-                        help="Evaluate every N timesteps")
-    parser.add_argument("--eval-episodes", type=int, default=20)
-    parser.add_argument("--n-envs", type=int, default=1,
-                        help="Number of parallel environments")
+    # PPO-specific
+    parser.add_argument("--n-steps", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--n-epochs", type=int, default=10)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--clip-range", type=float, default=0.2)
+    # REINFORCE-specific
+    parser.add_argument("--episodes-per-update", type=int, default=10)
     args = parser.parse_args()
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
-    # training env
-    if args.n_envs > 1:
-        train_env = SubprocVecEnv([lambda: make_env() for _ in range(args.n_envs)])
+    env = DiffDriveNavEnv()
+    np.random.seed(args.seed)
+    __import__("torch").manual_seed(args.seed)
+
+    print(f"Training {args.algo.upper()} for {args.total_timesteps} timesteps...")
+
+    if args.algo == "ppo":
+        agent, returns, lengths, successes, collisions, timesteps = train_ppo(env, args)
     else:
-        train_env = make_env()
+        agent, returns, lengths, successes, collisions, timesteps = train_reinforce(env, args)
 
-    # eval env (single instance)
-    eval_env = make_env()
+    env.close()
 
-    # callbacks
-    metrics_cb = MetricsCallback(log_dir=args.log_dir, verbose=1)
-    eval_cb = EvalCallback(
-        eval_env,
-        best_model_save_path=args.checkpoint_dir,
-        log_path=args.log_dir,
-        eval_freq=args.eval_freq,
-        n_eval_episodes=args.eval_episodes,
-        deterministic=True,
-        verbose=1,
+    # save model
+    model_path = os.path.join(args.checkpoint_dir, f"{args.algo}_final.pt")
+    agent.save(model_path)
+    print(f"Saved model to {model_path}")
+
+    # save metrics
+    metrics_path = os.path.join(args.log_dir, f"{args.algo}_metrics.npz")
+    np.savez(
+        metrics_path,
+        returns=np.array(returns),
+        lengths=np.array(lengths),
+        successes=np.array(successes),
+        collisions=np.array(collisions),
+        timesteps=np.array(timesteps),
     )
+    print(f"Saved metrics to {metrics_path}")
 
-    model = PPO(
-        "MlpPolicy",
-        train_env,
-        learning_rate=args.lr,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        n_epochs=args.n_epochs,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        clip_range=args.clip_range,
-        ent_coef=args.ent_coef,
-        policy_kwargs=dict(net_arch=args.net_arch),
-        tensorboard_log=args.log_dir,
-        seed=args.seed,
-        verbose=1,
-    )
-
-    print(f"Training PPO for {args.total_timesteps} timesteps...")
-    print(f"  Network: {args.net_arch}")
-    print(f"  LR: {args.lr}, Batch: {args.batch_size}, Epochs: {args.n_epochs}")
-
-    model.learn(
-        total_timesteps=args.total_timesteps,
-        callback=[metrics_cb, eval_cb],
-    )
-
-    # save final model
-    final_path = os.path.join(args.checkpoint_dir, "ppo_final")
-    model.save(final_path)
-    print(f"Saved final model to {final_path}.zip")
-
-    # save hyperparameters
-    hparams = vars(args)
-    with open(os.path.join(args.log_dir, "hparams.json"), "w") as f:
-        json.dump(hparams, f, indent=2)
-
-    train_env.close()
-    eval_env.close()
+    # save hparams
+    with open(os.path.join(args.log_dir, f"{args.algo}_hparams.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
 
 
 if __name__ == "__main__":
